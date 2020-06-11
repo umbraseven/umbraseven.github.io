@@ -1,7 +1,7 @@
 ---
 layout: post
 title:  "Linux2.6：进程管理"
-date:   2020-05-31 12:50:00 +0800
+date:   2020-06-03 12:50:00 +0800
 categories: Linux
 tags: Linux 进程 
 description: 
