@@ -1,0 +1,736 @@
+---
+layout: post
+title:  "Linux2.6：设备驱动"
+date:   2020-06-15 18:10:00 +0800
+categories: Linux
+tags: Linux 设备驱动
+description: 
+---
+
+*  目录
+{:toc}
+
+***
+
+## 设备与驱动
+
+### 让设备跑起来
+
+什么是驱动？我们为何需要它，如何定义它？
+
+驱动的原词是driver，要让设备跑起来，就要驱动。怎么才能说设备已经跑起来了？外设并不能看作一个独立设备，而是计算机io体系中的一部分，就如一个键盘，它的跑起来，是要加入到计算机整体架构里，要能和cpu通讯，要可以和其他部件一起协同运作。所以驱动大概做的就是这件事，让一个外部设备可以顺利加入到计算机体系中。
+
+从一个内核来看，如何才意味着一个设备已经加入大部队了？
+
+* 冯诺伊曼体系的计算机本质上是一个状态机，控制一个设备的核心是可以读和写它的状态，在cpu（计算核心）的眼里，设备的状态和内存的状态，或者其他状态本质上应该是一致的，虽然可能有着截然不同的真实含义。
+
+* 可以读和写它的状态，意味着某种通讯路径的建立。通讯是有主从关系的，在计算机体系里，cpu/内核/操作系统是主，设备是次。内核可以主动访问设备，设备不能主动访问内核。
+
+* 内核对设备的访问，对它的状态读写，需要什么？地址、格式、含义解析、处理。这大概就是设备运行中，驱动程序要负责完成的事（事实上，这也不可能由操作系统来提供，因为io设备的一大特点就是开放性、拓展性、未知性，操作系统和内核无法提前预知什么设备、多少设备会加入到它的io体系里来）。
+
+* 但是这就足够了吗？在设备运行之前，一定需要做一些初始化工作。比如告知内核设备的存在，分配某些数据结构，将设备纳入内核的整体管理，同时分配某些关键资源（比如访问中所需要用到的地址），也就是说，需要初始化和注册设备，要和内核在很多事情上达成一致。
+
+另外还有两个非常重要的：
+
+* 其一，设备的意义在于被使用，设备的直接使用者是某些用户程序而非内核，所以设备需要提供某种接口给用户程序。
+* 其二，操作系统需要知道设备与驱动的对应关系，才能将对设备接口的访问，转为对设备驱动程序的调用。
+
+***
+
+### 设备文件
+
+**这种接口应该如何定义？**
+
+如何才能将处于内核态的驱动程序，开放给用户态程序使用？如果直接定义一个函数，那用户程序肯定是访问不到的。占用一个系统调用，以这种方式陷入内核？那这么多设备难道每个都占一个？而且系统调用不能乱改，后期很麻烦。
+
+而且设备可能五花八门，大体上可以有无数种，如何才能让设备和用户程序之间是松耦合的关系？当我们将底层设备替换掉之后，上层的用户程序仍然可以依赖于某种通用接口运行，而不用做出任何更改，那就最好了。
+
+所以第一个基本的思路应该是，**所有的设备应该都持有某种统一的接口**。这是典型的归一化处理，归一化处理是面向对象思想的核心。
+
+所以问题也许可以变为，如果要对所有的设备进行抽象，提取它们的共性，然后根据这种共性来建立接口，那结果会如何？
+
+* 设备的本质是什么？我们对设备的基本操作是什么？读写它的状态，也就是读写它的数据。读写数据，不就是文件的基本操作吗？文件，不就是一种广义上的数据流吗？
+
+* 普通意义上的文件，一个磁盘文件系统内的文件，因为使用效率的关系，它们的存放往往是乱序的——很多文件的数据块共同存放在一个磁盘空间内，它们的数据在物理上可能是交错的，所以我们需要通过磁盘管理，通过inode、block、bmap等映射关系，得到文件的正确数据流。这种有序的数据流，就是文件。
+
+* 那我们也可以这样看设备，对于一个磁盘，我们可以不管其内数据的真实含义，就将磁盘中的所有数据看作是一个有序的数据流，那它就是一个广义上的文件。就如一幅打乱的扑克，你可以将其中所有的黑桃的位置连起来组成一个序列，称其为黑桃文件，同样还可以得到红桃文件、梅花文件、方块文件。但同时你也可以将整副牌看作是一个序列。这两种不同的视角，不同的文件定义完全可以共存，毫不冲突。
+
+所谓的文件，本来就是根据我们对数据流的定义而来的。你如何定义其有序，如何定义流的指向，就如何定义了文件。所以对于设备数据流的定义，我们得到了设备文件。我们对设备的访问，就是对某种文件的访问。我们对设备访问的接口，就可以完全使用访问文件的接口。而且它还天然地可以完成从内核态到用户态的开放，又实现了归一化，完美！
+
+***
+**调用转换**
+
+接口确定以后，剩下的一个工作就是如何完成这种转换？如何将对文件的接口调用，转换为对设备驱动程序的调用？这个工作是需要内核和设备驱动程序协同完成的。
+
+* 内核可以定义通用的转移逻辑，比如从对文件的系统调用sys_open()，通过设备文件的inode获取到设备号，再根据设备类型做各种处理，最后变为设备驱动程序所定义的some_read()之类的。这种转移的逻辑是通用的、框架性的。
+
+* 所以内核需要定义某种通用设备描述，使得一个具体的驱动程序可以将自己的实现注册进来。这种描述就是文件接口的描述，就是file_operations中的open/read/write/close等等。驱动程序则要在这种框架规范之下完成自己的实现，比如some_read/some_write之类的函数实现，并将它注册到内核中。整个链条，就变得完整了。
+
+***
+### 中断和总线
+
+
+但是在这种方式下，还有一个大坑，那就是cpu运行速度和io设备运行速度的严重不匹配。事实上，这种不匹配在计算机体系里几乎无处不在，而不只是cpu与外设之间。
+
+这个大坑引出了两个主题：中断和总线机制。
+
+**中断机制**
+
+cpu和io设备通讯时，最基础的方式就是轮询等待，这是一种空转同步的做法，在等待的过程里，cpu不会开其他的执行逻辑，同时cpu只要上电了就一直在跑，所以也没必要不运算了，这是一种忙等待。它所带来的就是严重的计算资源浪费。
+
+更合理的方式呢？就是我先去忙我的，你好了通知我，我再打断我那时候正在忙的事，过来响应你，接上之前的处理逻辑。这种异步、打断、恢复、多条执行逻辑并发的方式，就是中断的基本模式了。所以中断其实对于设备和驱动而言，并非必须。但是对于有效率的计算机体系而言，毫无疑问是必须的。
+
+中断是个很复杂的子系统，它内部的资源是有限的，由此又能衍生出关于设备驱动问题：
+
+irq线是有限的，中断号是有限的，这是系统的关键资源。所以，如何才能有效利用起来？复用大概是少不了的。如何复用？同一个中断线里放多个设备，发生了中断再来逐一判断？还是只有当设备确实需要使用中断了，才将中断线分配给它？
+
+什么时候设备需要使用中断？开始访问，要准备读写状态的时候。这不就是意味着设备文件被打开吗？所以，在打开设备文件的时候，再来分配系统资源，似乎就成了一种自然的做法。
+
+***
+**总线机制**
+
+总线是计算机体系中信息流动的通道，这种信息本质上都是以bit、以数据的形式存在的，但从业务的含义中，又可以分为地址、控制信息、data等多种，自然就有了多种总线的分类命名。而总线的底层实现又有很多很多种，速度、提供的服务都可能各不相同（这一块很杂很多，我了解得非常少，完全是模糊的）。
+
+不同的设备速度也是不匹配的，使用方式可能也不同，所以可能需要连接到不同的总线上。总线之间又需要通过某种方式连接起来，这就出现了桥。如主板上的南北桥。
+
+整个的总线机制在计算机io架构体系中应该是非常重要的，所以在设备驱动模型的设计中，直接规定所有设备都必须挂载在某一条总线上。
+
+这一种抽象是合理的，如果将总线视为数据流动的通道，那任何的设备数据都一定要通过这条通道才能送到内核。同样，内核就只需要从通道获取数据，而不是从无数接口不一的设备中去拿取数据了。
+
+
+***
+### 字符设备
+
+设备有类型之分吗？
+
+可以没有，或者说从文件的抽象上而言，本质上没有。但为了实际效率的考虑，可以有。最典型的，在计算机体系中最重要的，就是字符设备和块设备的区分。但这种分类不是绝对的，还是要从实际使用中出发去界定的，比如网络设备就是一种很特别的设备，很难用字符设备或者块设备来界定它。
+
+字符设备和块设备的核心区分点在哪里？
+
+* 对块设备，它的数据流是可能重新排序的。比如一个磁盘中有很多数据块，但我们在访问的时候是支持随机访问的，所以从它向外导出的数据流来看，并不是顺序的。不是顺序的，就意味着没有某种一定的“序”，那就是可能有无数种序，从某种角度而言，这种顺序是随机的。而对字符设备，它的数据流是顺序的，也就是说是有一个确定序的，它不支持随机访问。
+
+* 块设备的数据传输量往往很大，而字符设备的数据传输量一般都比较小。
+
+
+所以对于它们的处理方式也是不同的：
+
+* 对于字符设备，我们可以用更简单的方式进行处理，或者说我们需要做的优化、能做的优化都是有限的。事实上，内核做的处理也是很少的。
+
+* 当我们打开一个字符设备时，可以通过设备号找到注册的cdev数据结构，其中就有fops字段，描述了应该如何打开设备，如何完成设备状态的读写等等。成功打开后，返回的file对象中已经包含了我们注册在cdev中的fops，之后对设备的访问就可以直达了，而不会再经过def_chr_fops去中转了，所以在def_chr_fops只定义了open，其他都是不会用到的。
+
+
+* 对于块设备，因为它可能有大量的数据传输，而这种访问又是随机的（数据在物理上不连续），这就给了巨大的操作空间。所以对于块设备的访问，内核做了很多很多事，为此定义了多个抽象层，比如通用块层和io调度层。
+
+* 在块设备的open中，通过def_blk_fops层层周转，最后也确实调用了设备驱动程序自己定义的open，但是并没有将fops传递给file对象，所以file对象中所持有的fops仍然是新建一个设备文件时根据文件类型而初始化的def_blk_fops。所以之后对于块设备的各种访问，比如read/write，也还是要经过def_blk_fops来中转。
+
+* 为何要经过这种中转？因为操作系统额外提供了大量的优化工作，因为对块设备的访问要穿过页高速缓存，要穿过通用块层和io调度层。而设备驱动程序中所定义的对实际设备的读写，位于最底层，只是这庞大框架的很小的一部分。
+
+***
+### 当我们open一个文件
+
+我们可以通过open操作来看两种设备的处理差别。
+
+对于普通文件、字符设备文件、块设备文件，分别会如何一步步处理，最终拿到file文件对象，并在其中包含了合适的fops？而打开一个文件又意味着什么？
+
+```c
+/*
+ * 通用的文件打开接口，对于普通文件和设备文件共用。通过namei()查找目录项、获得inode的方式也是一样。
+ */
+struct file *filp_open(const char * filename, int flags, int mode)
+{
+    error = open_namei(filename, namei_flags, mode, &nd);
+    dentry_open(nd.dentry, nd.mnt, flags);
+    return ERR_PTR(error);
+}
+EXPORT_SYMBOL(filp_open);
+
+/*
+ * 在dentry_open中，设置file的各种字段，其中就包括f->f_op = fops_get(inode->i_fop)，
+ * 以及调用f->f_op->open(inode,f)。
+ */
+struct file *dentry_open(struct dentry *dentry, struct vfsmount *mnt, int flags)
+{
+    /* 主干 */
+    f = get_empty_filp();
+    inode = dentry->d_inode;
+
+    f->f_mapping = inode->i_mapping;
+    f->f_dentry = dentry;
+    f->f_vfsmnt = mnt;
+    f->f_pos = 0;
+    /* 设置op */
+    f->f_op = fops_get(inode->i_fop);
+    file_move(f, &inode->i_sb->s_files);
+
+    file_ra_state_init(&f->f_ra, f->f_mapping->host->i_mapping);
+    return f;
+}
+EXPORT_SYMBOL(dentry_open);
+
+/*
+ * 对于普通文件，大都可以直接用通用实现。
+ */
+struct file_operations ext2_file_operations = {
+    .llseek   = generic_file_llseek,
+    .read   = generic_file_read,
+    .write    = generic_file_write,
+    .ioctl    = ext2_ioctl,
+    .mmap   = generic_file_mmap,
+    .open   = generic_file_open,
+    .release  = ext2_release_file,
+};
+
+/*
+ * 如果是普通文件，在generic_file_open里，几乎什么都不做。因为既然可以访问到普通文件，
+ * 那该文件所属的文件系统所对应的块设备肯定已经打开、初始化好了。
+ */
+int generic_file_open(struct inode * inode, struct file * filp)
+{
+    if (!(filp->f_flags & O_LARGEFILE) && i_size_read(inode) > MAX_NON_LFS)
+        return -EFBIG;
+    return 0;
+}
+
+/*
+ * 对于设备文件，在建立文件时，会将inode中的fops初始化为通用设备处理方法，
+ * 比如def_chr_fops和def_blk_fops等。
+ */
+void init_special_inode(struct inode *inode, umode_t mode, dev_t rdev)
+{
+    inode->i_mode = mode;
+    if (S_ISCHR(mode)) {
+        inode->i_fop = &def_chr_fops;
+        inode->i_rdev = rdev;
+    } else if (S_ISBLK(mode)) {
+        inode->i_fop = &def_blk_fops;
+        inode->i_rdev = rdev;
+    } else if (S_ISFIFO(mode))
+        inode->i_fop = &def_fifo_fops;
+    else if (S_ISSOCK(mode))
+        inode->i_fop = &bad_sock_fops;
+    else
+        printk(KERN_DEBUG "init_special_inode: bogus i_mode (%o)\n",
+               mode);
+}
+EXPORT_SYMBOL(init_special_inode);
+
+/* 
+ * 字符设备的fops只有一个open，因为open之后就直接使用设备驱动的ops了
+ */
+struct file_operations def_chr_fops = {
+    .open = chrdev_open,
+};
+
+
+/*
+ * open()，对于设备文件，有很多额外的工作需要做。
+ * 对于字符设备文件，要根据设备号，通过kobj_map拿到cdev描述符（字符设备驱动），
+ * 并用其中定义的file_operations对file的ops进行替换，并调用其自定义open函数。
+ */
+int chrdev_open(struct inode * inode, struct file * filp)
+{
+    struct cdev *p;
+    struct cdev *new = NULL;
+    int ret = 0;
+    
+    p = inode->i_cdev;
+    if (!p) {
+        /* 通过散列表查找cdev */
+        kobj = kobj_lookup(cdev_map, inode->i_rdev, &idx);
+        new = container_of(kobj, struct cdev, kobj);
+        p = inode->i_cdev;
+        inode->i_cdev = p = new;
+        inode->i_cindex = idx;
+        list_add(&inode->i_devices, &p->list);
+    } 
+
+    /* 重新设置op并调用open() */
+    filp->f_op = fops_get(p->ops);
+    filp->f_op->open(inode,filp);
+    return ret;
+}
+
+/*
+ * 对块设备文件，需要定义的ops要多得多，除了本身的fops，还有缓存的aops。本身的fops里，
+ * 除了open之外，还有很多其他的字段。其中，open很复杂，write则是会和普通文件调用共同的底层实现。
+ */
+struct address_space_operations def_blk_aops = {
+    .readpage = blkdev_readpage,
+    .writepage  = blkdev_writepage,
+    .sync_page  = block_sync_page,
+    .prepare_write  = blkdev_prepare_write,
+    .commit_write = blkdev_commit_write,
+    .writepages = generic_writepages,
+    .direct_IO  = blkdev_direct_IO,
+};
+
+struct file_operations def_blk_fops = {
+    .open   = blkdev_open,
+    .release  = blkdev_close,
+    .llseek   = block_llseek,
+    .read   = generic_file_read,
+    .write    = blkdev_file_write,
+    .aio_read = generic_file_aio_read,
+    .aio_write  = blkdev_file_aio_write, 
+    .mmap   = generic_file_mmap,
+    .fsync    = block_fsync,
+    .ioctl    = block_ioctl,
+};
+
+
+static ssize_t blkdev_file_write(struct file *file, const char __user *buf,
+           size_t count, loff_t *ppos)
+{
+    struct iovec local_iov = { .iov_base = (void __user *)buf, .iov_len = count };
+
+    return generic_file_write_nolock(file, &local_iov, 1, ppos);
+}
+
+/* 
+ * 块设备一般不需要用设备号，通过散列表去查找bdev，因为inode字段里就有bdev。但是
+ * 块设备的处理更为复杂，因为它的访问涉及到很多层：缓存层、通用块层、io调度层……
+ * 这里需要注意的是，打开块设备时，并不会替换file的f_op对象，所以后续对于块设备文件的访问，
+ * 仍然是通过def_blk_ops来完成的，所以它中间包含了read/write等方法。
+ */
+static int blkdev_open(struct inode * inode, struct file * filp)
+{
+    /* inode->i_bdev有bdev字段 */
+    bdev = bd_acquire(inode);
+    /* 很复杂的处理逻辑，但总之是要调用fops->open()的 */
+    res = do_open(bdev, filp);
+    return res;
+}
+
+
+```
+
+打开一个文件意味着什么？
+
+获得file对象，代表某种形式的交互已经建立，有r/w方式，有ppos。对于普通文件，意味着已经和磁盘文件系统达成共识，占有这个数据序列，使得可以读或者写。对于设备文件，意味着建立访问通道，让我从逻辑上可以获得通畅的“数据流”，比如至少要让设备占用port、irq等系统资源，可以通讯。
+
+打开之后，某种路径就被建立了。数据流可以经由这种路径在“文件”和用户buf之间传输。
+
+我们可以粗略看看某种实际字符设备的read流程：
+
+```c
+/*
+ * 通用的vfs读文件操作，被sys_read调用。进行一系列判断后，会直接转移到file的fop中的read。
+ * 对于字符设备，会在open中直接将设备驱动中定义的cdev->fops传递给file，所以是直达。
+ * 对于块设备，则会调用def_blk_fops.read，也就是generic_file_read，而它指向的第一站就是cache。
+ */
+ssize_t vfs_read(struct file *file, char __user *buf, size_t count, loff_t *pos)
+{
+  ssize_t ret;
+
+  if (!(file->f_mode & FMODE_READ))
+    return -EBADF;
+  if (!file->f_op || (!file->f_op->read && !file->f_op->aio_read))
+    return -EINVAL;
+  if (unlikely(!access_ok(VERIFY_WRITE, buf, count)))
+    return -EFAULT;
+
+  ret = rw_verify_area(READ, file, pos, count);
+  if (!ret) {
+    ret = security_file_permission (file, MAY_READ);
+    if (!ret) {
+      if (file->f_op->read)
+        ret = file->f_op->read(file, buf, count, pos);
+      else
+        ret = do_sync_read(file, buf, count, pos);
+      if (ret > 0) {
+        dnotify_parent(file->f_dentry, DN_ACCESS);
+        current->rchar += ret;
+      }
+      current->syscr++;
+    }
+  }
+
+  return ret;
+}
+
+/*
+ * 某个字符设备的读实现。
+ * 这个函数会在vfs_read中被直接调用，中间除了一些常规的检查之外，几乎没有其他中转工作。
+ * 所以，由设备自身的read实现来负责控制读取的数据长度，以及传送到用户buf。
+ */
+static ssize_t eeprom_read(struct file * file, char * buf, size_t count, loff_t *off)
+{
+  int read=0;
+  unsigned long p = file->f_pos;
+
+  unsigned char page;
+
+  if(p >= eeprom.size)  /* Address i 0 - (size-1) */
+  {
+    return -EFAULT;
+  }
+  
+  /* 试图获得信号量，持有设备 */
+  while(eeprom.busy)
+  {
+    interruptible_sleep_on(&eeprom.wait_q);
+
+    /* bail out if we get interrupted */
+    if (signal_pending(current))
+      return -EINTR;
+    
+  }
+  eeprom.busy++;
+
+  page = (unsigned char) (p >> 8);
+  
+  if(!eeprom_address(p))
+  {
+    printk(KERN_INFO "%s: Read failed to address the eeprom: "
+           "0x%08X (%i) page: %i\n", eeprom_name, (int)p, (int)p, page);
+    i2c_stop();
+    
+    /* don't forget to wake them up */
+    eeprom.busy--;
+    wake_up_interruptible(&eeprom.wait_q);  
+    return -EFAULT;
+  }
+
+  if( (p + count) > eeprom.size)
+  {
+    /* truncate count */
+    count = eeprom.size - p;
+  }
+
+  /* stop dummy write op and initiate the read op */
+  i2c_start();
+
+  /* special case for small eeproms */
+  if(eeprom.size < EEPROM_16KB)
+  {
+    i2c_outbyte( eeprom.select_cmd | 1 | (page << 1) );
+  }
+
+  /* 实际的读数据函数 */
+  read = read_from_eeprom( buf, count);
+  
+  if(read > 0)
+  {
+    file->f_pos += read;
+  }
+
+  eeprom.busy--;
+  wake_up_interruptible(&eeprom.wait_q);
+  return read;
+}
+
+
+static int read_from_eeprom(char * buf, int count)
+{
+  int i, read=0;
+
+  for(i = 0; i < EEPROM_RETRIES; i++)
+  {    
+    if(eeprom.size == EEPROM_16KB)
+    {
+      i2c_outbyte( eeprom.select_cmd | 1 );
+    }
+
+    if(i2c_getack())
+    {
+      break;
+    }
+  }
+  
+  if(i == EEPROM_RETRIES)
+  {
+    printk(KERN_INFO "%s: failed to read from eeprom\n", eeprom_name);
+    i2c_stop();
+    
+    return -EFAULT;
+  }
+
+  /* while循环，循环读，直到计数满足count */
+  while( (read < count))
+  { /* 一次一个byte，直接传送到用户空间 */   
+    if (put_user(i2c_inbyte(), &buf[read++]))
+    {
+      i2c_stop();
+
+      return -EFAULT;
+    }
+
+    /*
+     *  make sure we don't ack last byte or you will get very strange
+     *  results!
+     */
+    if(read < count)
+    {
+      i2c_sendack();
+    }
+  }
+
+  /* stop the operation */
+  i2c_stop();
+
+  return read;
+}
+
+```
+
+***
+### 块设备
+
+
+块设备的处理过程呢？
+
+分析块设备的读写流程之前，不得不先讨论内核为了块设备访问而做的各种工作，建立的各种软件层。块设备访问的大概层次关系是：
+
+* VFS/文件系统层
+* 页高速缓存
+* 通用块层
+* io调度层
+* 块设备驱动程序
+* 硬件设备
+
+
+***
+**VFS层**
+
+vfs_read()内部会调用file->f_op->read(file, buf, count, pos)，上文中提到了块设备文件read会使用到def_blk_fops和其中的generic_file_read，事实上，基于块设备的普通文件，读文件的方式基本上和块设备是一样的，所以才定义了一个方法叫genereic读（值得注意的是，这个generic是面向文件的，而非设备的。所以def_blk_fops中的write，就不是generic_file_write,而是blkdev_file_write了）。
+
+以ext2为例：
+
+```c
+struct file_operations ext2_file_operations = {
+    .llseek   = generic_file_llseek,
+    .read   = generic_file_read,
+    .write    = generic_file_write,
+    .ioctl    = ext2_ioctl,
+    .mmap   = generic_file_mmap,
+    .open   = generic_file_open,
+    .release  = ext2_release_file,
+};
+```
+
+在generic_file_read中，要判断是否需要做特殊处理，比如直接io、异步io等。对于普通的正常读文件，最终会调用do_generic_mapping_read(filp->f_mapping,&filp->f_ra,filp,ppos,desc,actor)。也就是说，块设备的读，直接指向的就是对页高速缓存mapping的读。
+
+***
+**页高速缓存**
+
+在文件子系统里，我们有讨论过页高速缓存的具体实现，这就是直接的使用了。在do_generic_mapping_read()内部的处理里，有很复杂的处理逻辑，如果不出异常的话，当它返回时，文件的数据页已经从磁盘读到内存，且对应page已经插入到了文件的mapping中了。而且，用户所需要的数据，也已经从page复制到了用户缓冲区buf。
+
+其中要做哪一些处理？
+
+* 首先是要判断数据是否已经在缓存中了，这是缓存之所以存在的核心，减少对磁盘的访问次数，希望用户对文件的访问可以直接在缓存层完成。缓存命中是从两个维度上去提升的：首先是空间局部性，用户很有可能会访问到上次访问过的数据旁边的数据，所以我一次读一页，即使用户上次只要一个字节，这样它下次访问时，很有可能需要的新数据已经存在于缓存了。其次是时间局部性，之前访问过的数据，用户很有可能再次访问。
+
+* 如果在缓存中，且有效，那就直接使用。什么情况下，它的数据会无效？第一种情况是分配了page，但还没有实际读数据完成，这时候肯定是无效的。我们判断“是否在缓存中”，其实判断对应的page是否在缓存中，而非数据是否在。第二种情况，则是真实数据发生了改变，而缓存中的数据未更新，所以是过期的，自然也无效。
+
+* 这种情况可能发生吗？我不确定，只能猜一猜。正常情况下是不应该发生的，因为用户对文件的读写全部要经过缓存，所以缓存中的数据一定是比磁盘要新的。但是缓存中的数据就一定是存在于磁盘吗？不能是某种虚拟的吗，比如存在于内存？不应该，在内存你直接访问不香吗，还搞什么缓存？即使它就在磁盘或者其他块设备中，但是它就不能在底层发生改变，导致数据失效吗？好像也不应该，这样的话还怎么做缓存？磁盘数据改变后我如何反过来通知内核呢？这样就有点太绕了一点。应该在缓存设计中，持有这样的假设，对磁盘的访问都是经过内核的，内核对磁盘的访问都是经过缓存的，这样才可以在其中做各种同步保护。
+
+如果数据无效，那就要想办法从数据源读数据了。如何才能读到数据呢？
+
+* 首先，既然已经可以read了，那说明设备已经被open了，这也就意味着数据访问的通道已经建立起来了，相关硬件设备都已经准备好了。
+
+* 这条通道在哪里呢？inode当然要负责持有关于数据流的信息。对于ext2普通文件，通过dev找到块设备，通过idata字段可以找到文件数据块号和块设备数据块号的对应关系。page中有mapping可以拿到inode，有index可以拿到文件数据位置，一顿换算，就可以得到数据在块设备中的地址（初始块号）了。
+
+* 在页高速缓存里，实际的读页是通过调用mapping->a_ops->readpage(filp, page)完成的，readpage是各个文件系统自己定义的，比如ext2就实现了ext2_readpage，在其中调用了mpage_readpage(page, ext2_get_block)。
+
+* mpage_readpage是通用的读页实现，ext2只需要将自己的映射关系处理函数作为回调函数注入，就可以享受它的服务了。在mpage处理中，会将读页需求进行合并，组合为一个bio，并submit给通用块处理层。bio处理完成后，再将页进行分发，这样就完成了页数据的访问。
+
+***
+**通用块处理层**
+
+为什么会有这样的一个层？它是做什么的？它解决了什么问题？
+
+我们首先需要关注的一个问题是，在数据进行各种转移的时候，它的基本传输单位是什么？
+
+* 用户在处理一个文件时，面对的是一种数据流，这种流的基本单位是字节，其中可能有换行，但总的来说并没有严肃的分块。但是在传输、存储这种大规模的数据处理，而不关注其业务含义时，以字节单位毫无疑问是低效的。
+
+* 所以在缓存时，数据的基本单位是页。这是和内存子系统相一致的。这样能方便进行很多处理，比如页框的申请、管理、回收，而不需要特意给它分一个区，做特殊化处理（就像0.11对于buffer的处理一样）。
+
+* 但是我们给文件的逻辑定义上，数据不是以页来区分，而是以块来区分的。这个块的大小需要根据实际应用场景来确定，但肯定是扇区大小的幂次倍。因为页也是扇区大小的幂次倍，所以页也就是块大小的幂次倍。
+
+* 而在实际的磁盘中，数据是以扇区为单位的，在物理级别上，是不了解所谓文件和块的。
+
+所以问题就来了，在io传输中，应该以什么为单位？扇区？块？页？还是其他的？
+
+* io传输中，有一些什么基本要求？首先当然是一次传输尽可能的多，因为耗费时间的是io，而不在于传输的多少；其次一次io处理中，传送的数据必须是连续的，如果是非连续的，那要发过去一个映射关系，那也太麻烦了一点。
+
+* 所以io传输的基本单位，应该是动态的，只要它连续，就应该尽可能地长。这就是bio所做的事情，能将不同的page访问请求进行合并，如果是挨着的，那就合并到一起，成为一个bio，一次性处理。在bio中，有一个vector，里面就放着不同的page请求。
+
+当然，能合并那当然是最好的。但是还有一个可能的情况是，不但不能合并，还得拆分。因为高速缓存的单位是page，而文件的逻辑单位是块，一个page可能包含多个块，这些块在物理设备中可能不是顺序存放的，不能在一个bio中处理。
+
+那怎么办？拆。这就需要定义为缓冲区缓存页，用buffer_head挨个描述，然后用bio一个一个处理。
+
+不管是合并到一起一次访问一大段，还是要拆了一个块一个块地访问（一个块在磁盘上一定是由连续扇区存放的），最后都是由bio来处理的。
+
+bio做了什么呢？打包为一个request，提交给io调度层，并等待结果。（这个中间的等待、睡眠、唤醒关系是怎么样的？在linux0.11中，进程是等待在buffer_head的等待队列的，在2.6呢？我没注意，猜一下的话，应该是等待page吧。在bio层应该是不会阻塞的，其中很多函数都会在中断中被调用）
+
+我没有过多地关注通用块层，其中好像引入了disk这个概念，是一种逻辑块设备，通用块层处理的对象就是这种逻辑块设备。（这一块很模糊，略过了）
+
+***
+**io调度层**
+
+io调度层是为了做什么？当然是为了更有效率地访问磁盘。它的出发点是这样的：在机械磁盘的访问中，寻道是最耗时的。所以在处理不同的访问请求时，最好根据磁道位置做一些聚合，就近访问，这样就能显著提高效率了。
+
+但同时又要考虑到饥饿、deadline、预期时间、公平性等各种问题，所以大的策略是用电梯算法，但实际的算法有很多种。另外，在io调度层会再做一次聚合，如果不同的request刚好前后挨着，那就可以聚合为一个大request一次性处理（类似于对线性区的合并）。
+
+在这些处理的最后的最后，就是调用设备驱动程序了（应该吧？我没跟踪源码……）
+
+***
+## 设备驱动模型
+
+### 内核如何管理设备驱动？
+
+**
+
+如果暂时略掉设备注册、初始化部分不谈的话，设备和驱动大概就这样跑起来了（也许吧……）。那为何还有设备驱动模型这种古里古怪的东西？
+
+设备驱动模型，它首先是一个模型，是一个框架性的东西，而不是实实在在的驱动。这个分别非常重要。之所以提出设备驱动模型，是因为硬件设备本身是非常复杂的，设备的类型太多了，导致对它们的整体管理变得很困难。典型的管理行为有，层次依赖管理、电源管理、即插即用、热插拔、属性可视化等。
+
+我们现在面对成千上万种设备，希望把它们全部纳入我们的设备体系里，能实现一些基本的通用管理行为，我们该怎么做？
+
+面向对象思想是处理归一化问题的有效方式。**文件是设备的用户视角抽象，而“组件”是设备的内核视角抽象。**
+
+从内核管理来看，我不管你设备数据的含义是什么，我更关注的是你设备本身。
+
+* 设备是如何和我连接的？通过bus。设备是如何运行的？通过driver。于是乎，三个核心组件就有了：bus、driver、device。bus是我的主干，driver和device都可以挂载到bus上，并在上面进行配对。
+* 作为bus，那就需要维护属于它的drivers、devices，要实现match方法。作为driver，则要实现probe/remove方法，以此来探测和移除设备等等。
+* 在这样的架构之下，如果在某个bus新添加一个设备，那就可以由bus遍历它所持有的drivers，看能否驱动该设备；同样，如果一个新driver加入了bus，可以遍历它上面还没找到驱动的device，看能否适配。这样，就为即插即用、热插拔提供了驱动匹配条件。
+* 设备种类繁多，每一种设备都需要有自己的类型，但是很多设备其实是有着相似之处的，为了尽可能的代码复用，所以又引入了class，即为设备类。
+* 在这种架构之中，层次依赖关系也是自然的，设备和驱动都是依赖于总线的，而总线自身也可以是一个设备，它又可以依赖于桥设备，桥作为一个设备，又可以依赖于某总线……最终，就可以组织为一棵树，树中的每一个节点，就对应一个组件。
+* 基于这棵树，内核可以做电源管理、可以做资源管理，可以保证在启用某一个设备之前，先启用它所依赖的总线。
+
+***
+### 基础组件：kobject
+
+如何实现这种架构？如何实现这棵树？
+
+这棵树中，虽然有多种组件，但本质上来说都是“组件”，类似于树中的节点。由这种节点数据来维护层次关系，同时作为某些通用管理操作的入口，似乎是自然的。这个所谓的“组件数据”，就是kobject。
+
+kobject可以视为设备驱动模型的基类，放在某些编程语言中，那就是object级别的存在（这就是为什么它叫kobject吗……）。在它的内部包含了一些什么？
+
+```c
+struct kobject {
+  char      * k_name;
+  char      name[KOBJ_NAME_LEN];
+  struct kref   kref;
+  struct list_head  entry;
+  struct kobject    * parent;
+  struct kset   * kset;
+  struct kobj_type  * ktype;
+  struct dentry   * dentry;
+};
+
+```
+
+核心有三：
+
+* kref，引用计数。用于资源的管理，自动释放。
+* ktype，组件类型。其中有函数指针，使得对kobject的操作可以顺利传递到它的派生类。比如资源释放，光释放一个kobject当然是不行的，得释放一个最终的实际组件对象。
+* parent、kest，层次关系。
+
+
+***
+关于kest：
+
+* 我认为要用派生的方式来看kset。
+* kset内嵌了一个kobject，也就是说它本身就是一个kobject，适用于kobject的全部操作同样适用于它，只是它还增加了其他字段。所以kset也是一个组件，但它是一个容器组件，可以带一堆儿子。所以在bus中，drivers和devices的类型都是kset。
+* 类似的还有subsystem，它大概就可以看作是一个kset，表示它本身就是一个容器组件，bus本身是一个kset，所以它内嵌的是一个subsystem而非kobject。对于device和driver，则直接内嵌了kobject。
+* 所以，bus、device、driver，都可以看作是kobject的派生，都是这个体系中的“组件”。
+* 因为这棵树里都是组件，都是继承自kobject的，那我们自然就可以基于kobject来实现一些统一管理，比如组件的加入、释放等等。
+
+
+***
+### 驱动模型与驱动
+
+到这里，我们有必要回过头来确定很重要的一点：设备驱动模型是服务于“组件”的，也就是设备驱动本身的，而不负责驱动设备，那是驱动本身该干的活。
+
+这有些类似于工人和工会的关系。
+
+* 工人可以加入工会，工会可以为工人提供各种服务，争取福利。但工会并不会代替工人承担本该属于它的岗位职责，并不会去干工人的活。工会所服务的，是工人本身，而不是工人的活。
+
+* 同时，工人完全可以不加入工会，它仍然是完整的，这完全不影响到它的工作。但是加入工会是有好处的，可以享受它的服务，免去很多麻烦。
+
+* 驱动模型也是类似的，它提供了驱动管理的某种通用模型，从而让驱动开发变得简单起来，你只需要管你所要干的活，和系统如何打交道，如何注册，如何匹配等这些具体业务逻辑之外的事，这个框架帮你完成了。
+
+***
+### sysfs
+
+设备驱动模型附带提供的一大服务，就是将设备的属性通过虚拟文件系统的方式，开放到了用户空间，这个文件系统就是sysfs。
+
+这种树形架构和文件系统之间非常匹配，在sysfs中，每一个组件（kobject）都会对应一个目录，而最后的文件都是属性attr。attr提供了show/store方法供文件系统调用，以实现属性的读和写。
+
+我想很值得讨论的一个点是，sysfs和设备文件的关系、异同。
+
+* sysfs和设备文件都是通过文件系统，建立从内核到用户的接口。通过设备文件，用户程序可以操作设备，完成对设备数据的读写。通过sysfs，用户程序可以浏览和修改设备的属性。
+
+* 它们的焦点不同。设备文件关注的是数据，而sysfs关注的是设备本身。用户使用设备文件的目的，是其业务功能的实现；用户使用sysfs的目的，是管理设备，比如修改其业务功能。
+
+* 它们实现的方式也不同。对设备文件的访问，最后会传递到设备驱动程序，读写的设备也是指向实际设备的（当然可以有虚拟设备、逻辑设备这种东西）。对sysfs文件的访问，也就是对组件属性的访问，指向的是属性附带的show/store方法，数据来源其实是内存，没有io交互，sysfs本质上是一个基于ramfs的虚拟文件系统。
+
+所以，设备文件是设备的使用接口，而sysfs是设备的管理接口。
+
+***
+### 一个usb设备的上线之路
+
+最后，我们可以以一个实际设备的上线过程来穿越这一个主题——
+
+一个usb设备，从它连接到电脑开始，如何注册、初始化，最终成为设备驱动体系中的一个组件，被sysfs所管理？
+
+***
+**调用关系**
+
+
+* hub_events()中，如果检测到有新设备连接，会调用hub_port_connect_change(hub, i,portstatus,portchange)。
+* 在其中，会依次调用
+  * usb_alloc_dev(hdev, hdev->bus, port1)：在其中，会调用kmalloc(sizeof(\*dev), GFP_KERNEL)和device_initialize(&dev->dev)，完成usb_dev数据结构的分配和初始化。
+  * choose_address(udev)：设置地址
+  * hub_port_init(hub, udev, port1, i)：端口初始化
+  * usb_new_device(udev)，在内部调用device_add (&udev->dev)，做大量处理。
+  * 首先要调用kobject_add(&dev->kobj)，将设备注册到设备体系里去，同时会创建sysfs目录和文件。
+  * 然后会调用bus_add_device(dev)，在其中会触发attach、match、probe，进行驱动匹配，资源分配等。
+  * 还有一些其他的处理，比如属性添加，sysfs各个目录下的文件创建等等。
+
+hub_events()是如何被调用的呢？
+
+>usb_hub_init(void)
+>>kernel_thread(hub_thread, NULL, CLONE_KERNEL);
+>>>hub_thread(void*)
+>>>>do{ }while(!signal_pending(current));
+>>>>>hub_events()
+>>>>>wait_event_interruptible(); 
+
+
+ 
+在hub_thread里是一个while循环，每一次醒来都处理hub_events中的所有事件，然后睡眠等待中断。只要没有收到其他信号，这个内核线程就不会退出。
+ 
+中断唤醒呢？
+
+>hub_irq(urb, regs)
+>>kick_khubd(hub);
+>>>wake_up(&khubd_wait);
+
+***
+**流程说明**
+
+* usb设备插入usb口，设备上电，开始自动执行一些通讯工作，最后这个设备被usb hub（集线器）捕获，判定为一个合法的usb设备，触发中断。
+* 在hub_irq()里，唤醒hub_thread()，在其中执行hub_events()。
+* 在hub_events()的处理中，检测到有新设备连接进来，于是分配usb_dev数据结构（其内包含了dev组件），并开始做初始化工作。
+* 设置地址，初始化端口，将它加入到设备驱动模型里，为它创建sysfs文件，并注册到bus总线上，又触发driver match。如果成功配对，还会执行probe，在其中可能又会注册中断……
+* 同时应该还会通过uevent传递到用户空间，创建设备文件。
+* 至此，设备就可以被访问了。
+
+值得注意的是，linux设备驱动模型只是整体管理设备的一个软件框架，并没有包含过多的东西。
+
+在上面的流程中，主导者并不是设备驱动模型，大部分工作是由usb总线的驱动推动的。如果你希望你的设备被统一管理，那就把device注册到sysfs中去。但是这个device是如何创建的，sysfs不管。设备驱动模型是服务于所有驱动的一个框架，但并不是驱动本身。需要驱动自己做的事情就得驱动自己做，比如识别出来属于自己的设备，初始化，通讯，中断，数据解析等等。
+
+
+***
+### 如何基于设备驱动模型写驱动？
+
+我还不知道，没有实际写过，很多细节很模糊……
+
+但我想，一般来说，是不会直接继承基本组件，如device、driver之类的去写的，如果是pci设备，大概就是基于pci_driver来写，相当于它已经做了一次派生、实现了很多功能了，我们需要做的是实现属于我们设备的部分，将它合理地嵌进去。
+
+***
+
+
+
+
